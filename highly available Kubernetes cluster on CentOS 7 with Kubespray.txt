@@ -1,0 +1,353 @@
+Master1 10.38.87.251  CPU: 2 RAM: 2G HDD: 20G OS: CentOS7
+master2 10.38.87.252  CPU: 2 RAM: 2G HDD: 20G OS: CentOS7
+master3 10.38.87.253  CPU: 2 RAM: 2G HDD: 20G OS: CentOS7
+worker1 10.38.87.254  CPU: 1 RAM: 2G HDD: 20G OS: CentOS7
+
+Note: better to stop and disable firewalld - use ssh-keygen -t rsa then copy all ssh key to all hosts
+
+Step 1: prepare your servers
+sudo yum -y update
+Install haproxy and keepalived on the master nodes as follows
+
+sudo yum install epel-release
+sudo yum install haproxy keepalived -y
+
+Configure SELinux as permissive on all master and worker nodes as follows
+
+sudo setenforce 0
+sudo sed -i 's/^SELINUX=enforcing$/SELINUX=permissive/' /etc/selinux/config
+
+Step 2: Configure Keepalived
+
+Keepalived implements a series of checkers for dynamic and adaptive maintenance and management of the server pool with load balancing according to their state.
+On the other hand, the high availability is enhanced by the Redundancy protocol for virtual routers (VRRP).
+
+Configure on the first master to stay alive as follows:
+
+$ sudo vim /etc/keepalived/keepalived.conf
+vrrp_script chk_haproxy {
+  script "killall -0 haproxy"
+  interval 2
+  weight 2
+}
+
+vrrp_instance VI_1 {
+  interface eth0
+  state MASTER
+  advert_int 1
+  virtual_router_id 51
+  priority 101
+  unicast_src_ip 10.38.87.251    ##Master 1 IP Address
+  unicast_peer {
+      10.38.87.252               ##Master 2 IP Address
+      10.38.87.253               ##Master 3 IP Address
+   }
+  virtual_ipaddress {
+    10.38.87.250                 ##Shared Virtual IP address
+  }
+  track_script {
+    chk_haproxy
+  }
+}
+
+Configure on the second master to stay alive as follows:
+
+$ sudo vim /etc/keepalived/keepalived.conf
+vrrp_script chk_haproxy {
+  script "killall -0 haproxy"
+  interval 2
+  weight 2
+}
+
+vrrp_instance VI_1 {
+  interface eth0
+  state BACKUP
+  advert_int 3
+  virtual_router_id 50
+  priority 100
+  unicast_src_ip 10.38.87.252    ##Master 2 IP Address
+  unicast_peer {
+      10.38.87.253               ##Master 3 IP Address
+      10.38.87.251               ##Master 1 IP Address
+   }
+  virtual_ipaddress {
+    10.38.87.250                 ##Shared Virtual IP address
+  }
+  track_script {
+    chk_haproxy
+  }
+}
+
+Configure on the third master to stay alive as follows:
+
+$ sudo vim /etc/keepalived/keepalived.conf
+vrrp_script chk_haproxy {
+  script "killall -0 haproxy"
+  interval 2
+  weight 2
+}
+
+vrrp_instance VI_1 {
+  interface eth0
+  state BACKUP
+  advert_int 3
+  virtual_router_id 49
+  priority 99
+  unicast_src_ip 10.38.87.253    ##Master 3 IP Address
+  unicast_peer {
+      10.38.87.251               ##Master 1 IP Address
+      10.38.87.252               ##Master 2 IP Address
+   }
+  virtual_ipaddress {
+    10.38.87.250                 ##Shared Virtual IP address
+  }
+  track_script {
+    chk_haproxy
+  }
+}
+
+-vrrp_instance defines a single instance of the VRRP protocol that runs on an interface. This was named arbitrarily as VI_1.
+-state defines the initial state in which the instance should start.
+-interface defines the interface on which VRRP is executed.
+-virtual_router_id is the unique identifier of the node.
+-Priority is the advertised priority that you learned about in the first article in this series. As you will learn in the next article, priorities can be adjusted at runtime.
+-advert_int is the number of times advertisements are sent (3 seconds in this case).
+-Authentication specifies the information required by servers participating in VRRP to authenticate each other. In this case it has not been configured.
+-virtual_ipaddress defines the IP addresses (there can be several) for which VRRP is responsible.
+
+Start and activate Keepalived
+
+After the configuration has been carried out in each of the master nodes, start and activate to stay alive as follows
+
+sudo systemctl start keepalived
+sudo systemctl enable keepalived
+
+if Keepalived running in each node you should see a new IP added in your interface like this in 1 of the master nodes which has the high priority:
+
+2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UP group default qlen 1000        
+    link/ether 52:54:00:f2:92:fd brd ff:ff:ff:ff:ff:ff
+    inet 10.38.87.252/24 brd 10.38.87.255 scope global noprefixroute eth0
+       valid_lft forever preferred_lft forever
+    inet 10.38.87.250/32 scope global eth0
+
+Step 3: Configure HAproxy
+
+HAProxy is a free, very fast and reliable solution that offers high availability, load balancing and proxying for TCP and HTTP based applications.
+It is particularly suitable for websites with very high traffic and supports a whole range of the most visited websites in the world.
+Over the years it has become the de facto standard open source load balancer and it now ships with most mainstream Linux distributions.
+
+We will configure HAProxy in the three master nodes as follows:
+
+$ sudo vim /etc/haproxy/haproxy.cfg
+global
+
+    log         127.0.0.1 local2
+
+    chroot      /var/lib/haproxy
+    pidfile     /var/run/haproxy.pid
+    maxconn     4000
+    user        haproxy
+    group       haproxy
+    daemon
+
+    # turn on stats unix socket
+    stats socket /var/lib/haproxy/stats
+#---------------------------------------------------------------------
+# common defaults that all the 'listen' and 'backend' sections will
+# use if not designated in their block
+#---------------------------------------------------------------------
+defaults
+    mode                    http
+    log                     global
+    option                  httplog
+    option                  dontlognull
+    option http-server-close
+    option forwardfor       except 127.0.0.0/8
+    option                  redispatch
+    retries                 3
+    timeout http-request    10s
+    timeout queue           1m
+    timeout connect         10s
+    timeout client          1m
+    timeout server          1m
+    timeout http-keep-alive 10s
+    timeout check           10s
+    maxconn                 3000
+#---------------------------------------------------------------------
+# apiserver frontend which proxys to the masters
+#---------------------------------------------------------------------
+frontend apiserver
+    bind *:8443
+    mode tcp
+    option tcplog
+    default_backend apiserver
+#---------------------------------------------------------------------
+# round robin balancing for apiserver
+#---------------------------------------------------------------------
+backend apiserver
+    option httpchk GET /healthz
+    http-check expect status 200
+    mode tcp
+    option ssl-hello-chk
+    balance     roundrobin
+        server master1 10.38.87.251:6443 check
+        server master2 10.38.87.252:6443 check
+        server master3 10.38.87.253:6443 check
+
+After you have made the configuration details, simply allow the configured port on your firewall, start and then activate the Haproxy service.
+
+sudo firewall-cmd --permanent --add-port=8443/tcp && sudo firewall-cmd --reload 
+sudo systemctl restart haproxy
+sudo systemctl enable haproxy
+
+Step 4: clone Kubespray Git repository and add configurations
+
+In this step we will pick kubespray files on our local computer (maybe 1 of the master nodes) and then make the necessary configurations by selecting containerd as a container runtime as well as filling the necessary files with the details of our servers (etc, foremen, workers).
+
+cd ~
+git clone https://github.com/kubernetes-sigs/kubespray.git
+Cloning into 'kubespray'...
+
+$ cd kubespray
+This directory contains the inventory files and playbooks used to deploy Kubernetes.
+
+Step 5: Prepare the local computer
+On the local machine from which you are deploying, you will need to install the Python package manager pip.
+
+curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py
+python3 get-pip.py --user
+
+Step 6: Create the Kubernetes cluster inventory file and install dependencies
+
+The inventory consists of 3 groups:
+
+Kube node: List of Kubernetes nodes on which the pods are running.
+Kube Master : List of servers running Kubernetes master components (Apiserver, Scheduler, Controller).
+etcd: List of servers to create the etcd server. You should have at least 3 servers for failover purposes.
+There are also two special groups:
+
+Calico rr : explained for advanced calico network cases
+bastion : Configure a bastion host if your nodes are not directly reachable
+
+Create an inventory file:
+
+cp -rfp inventory/sample inventory/mycluster
+
+Define your inventory with the IP addresses of your server and assign it to the correct node purpose.
+
+$ vim inventory/mycluster/inventory.ini
+
+master1   ansible_host=10.38.87.251 ip=10.38.87.251
+master2   ansible_host=10.38.87.252 ip=10.38.87.252
+master3   ansible_host=10.38.87.253 ip=10.38.87.253
+worker1   ansible_host=10.38.87.254 ip=10.38.87.254
+
+# ## configure a bastion host if your nodes are not directly reachable
+# bastion ansible_host=x.x.x.x ansible_user=some_user
+[kube-master]
+master1
+master2
+master3
+
+[etcd]
+master1
+master2
+master3
+
+[kube-node]
+worker1
+
+[calico-rr]
+
+[k8s-cluster:children]
+kube-master
+kube-node
+calico-rr
+
+Add A records to / etc / hosts on your workplace.
+
+$ sudo vim /etc/hosts
+master1 10.38.87.251
+master2 10.38.87.252
+master3 10.38.87.253
+worker1 10.38.87.254
+
+If your SSH private key has a passphrase, save it before you begin provisioning.
+
+$ eval `ssh-agent -s` && ssh-add
+Agent pid 4516
+Enter passphrase for /home/centos/.ssh/id_rsa: 
+Identity added: /home/tech/.ssh/id_rsa (/home/centos/.ssh/id_rsa)
+Install dependencies on requirements.txt
+
+# Python 2.x
+sudo pip install --user -r requirements.txt
+
+# Python 3.x
+sudo pip3 install -r requirements.txt
+Confirm the ansible installation.
+
+$ ansible --version
+ansible 2.9.6
+  config file = /etc/ansible/ansible.cfg
+  configured module search path = ['/home/tech/.ansible/plugins/modules', '/usr/share/ansible/plugins/modules']
+  ansible python module location = /usr/lib/python3/dist-packages/ansible
+  executable location = /usr/bin/ansible
+  python version = 3.8.5 (default, Jan 28 2021, 12:59:40) [GCC 9.3.0]
+
+Check and change parameters under Inventory / mycluster / group_vars
+
+We will review and change parameters under Inventory / mycluster / group_vars to ensure, that Cube spray Used containerd.
+
+##Change from docker to containerd at around line 176 and add the two lines below
+
+$ vim inventory/mycluster/group_vars/k8s-cluster/k8s-cluster.yml
+container_manager: containerd
+etcd_deployment_type: host
+kubelet_deployment_type: host
+Then in “Inventory / mycluster / group_vars / all / all.yml”File, make the following changes
+
+$ vim inventory/mycluster/group_vars/all/all.yml
+##Add Load Balancer Details at around line 20  
+loadbalancer_apiserver:
+   address: 10.38.87.250
+   port: 8443
+
+Step 7: Allow required Kubernetes ports on the firewall
+
+Kubernetes uses many ports for different services. Because of this, we need to allow access to the firewall as follows.
+
+Allow the ports on the three master nodes as follows
+
+sudo firewall-cmd --permanent --add-port={6443,2379-2380,10250-10252,179}/tcp --add-port=4789/udp && sudo firewall-cmd --reload
+On the worker nodes, allow the required ports as follows:
+
+sudo firewall-cmd --permanent --add-port={10250,30000-32767,179}/tcp --add-port=4789/udp && sudo firewall-cmd --reload
+Then allow IP forwarding on all nodes as follows:
+
+sudo modprobe br_netfilter
+sudo sh -c "echo '1' > /proc/sys/net/bridge/bridge-nf-call-iptables"
+sudo sh -c "echo '1' > /proc/sys/net/ipv4/ip_forward"
+Step 8: Deploy Kubernetes clusters with Kubespray Ansible Playbook
+Now run the playbook to deploy production-ready Kubernetes with Ansible. Please note that the target servers must have access to the Internet in order to retrieve images.
+
+Start the deployment by running the command:
+
+ansible-playbook -i inventory/mycluster/inventory.ini --become 
+--user=master --become-user=root cluster.yml
+
+Once the playbook has finished running, log into the master node and check the cluster status.
+
+$ sudo kubectl cluster-info
+Kubernetes master is running at https://haproxy.computingforgeeks.com:8443
+
+To further debug and diagnose cluster problems, use 'kubectl cluster-info dump'.
+You can also check the knots
+
+$ sudo kubectl get nodes
+NAME      STATUS   ROLES    AGE   VERSION
+master1   Ready    master   33h   v1.19.5
+master2   Ready    master   29h   v1.19.5
+master3   Ready    master   29h   v1.19.5
+worker1   Ready    <none>   29h   v1.19.5
+
